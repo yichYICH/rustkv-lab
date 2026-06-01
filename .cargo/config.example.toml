@@ -1,0 +1,20 @@
+# Optional local Cargo configuration example.
+# Copy selected entries to .cargo/config.toml only when your machine needs them.
+# Do not commit machine-specific absolute paths.
+
+[build]
+# Optional on Windows. Remove or change this line if you build on Linux/macOS
+# or if you intentionally use another Rust target.
+target = "x86_64-pc-windows-msvc"
+# Keep build artifacts in an ASCII-only directory when your repository path
+# contains non-ASCII characters. You may change this to "target" if your local
+# path has no linker issues.
+target-dir = "C:/Temp/rustkv-lab-target"
+
+# If Windows cannot find the MSVC linker, install the MSVC toolchain first.
+# If you still need to point Cargo to LLVM tools, replace these placeholder paths
+# with paths that exist on your own machine.
+#
+# [target.x86_64-pc-windows-msvc]
+# linker = "C:/path/to/LLVM/bin/lld-link.exe"
+# ar = "C:/path/to/LLVM/bin/llvm-lib.exe"

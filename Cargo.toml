@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustkv-protocol",
+    "crates/rustkv-core",
+    "crates/rustkv-server",
+    "crates/rustkv-cli",
+    "crates/rustkv-monitor",
+    "crates/rustkv-bench",
+]
