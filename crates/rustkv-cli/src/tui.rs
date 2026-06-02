@@ -214,18 +214,16 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &ShellApp) {
 }
 
 fn draw_history(frame: &mut Frame<'_>, area: Rect, app: &ShellApp) {
-    let visible_lines = area.height.saturating_sub(2) as usize;
-    let start = app.history.len().saturating_sub(visible_lines);
-    let text = app.history[start..].join("\n");
+    let visible_width = area.width.saturating_sub(2) as usize;
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let text = app.visible_history_text(visible_width, visible_height);
 
-    let paragraph = Paragraph::new(text)
-        .block(
-            Block::default()
-                .title("Command Stream")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue)),
-        )
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(text).block(
+        Block::default()
+            .title("Command Stream")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Blue)),
+    );
 
     frame.render_widget(paragraph, area);
 }
@@ -235,7 +233,7 @@ fn draw_help_panel(frame: &mut Frame<'_>, area: Rect, app: &ShellApp) {
         help_item("PING"),
         help_item("SET name rust"),
         help_item("GET name"),
-        help_item("DEL name other"),
+        help_item("DEL name [other]"),
         help_item("EXISTS name"),
         help_item("KEYS"),
         help_item("EXPIRE name 30"),
@@ -347,6 +345,47 @@ impl ShellApp {
         let start = chars.len().saturating_sub(max_width);
         chars[start..].iter().collect()
     }
+
+    fn visible_history_text(&self, width: usize, height: usize) -> String {
+        if width == 0 || height == 0 {
+            return String::new();
+        }
+
+        let rows = self
+            .history
+            .iter()
+            .flat_map(|line| wrap_history_line(line, width))
+            .collect::<Vec<_>>();
+        let start = rows.len().saturating_sub(height);
+        rows[start..].join("\n")
+    }
+}
+
+fn wrap_history_line(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+
+    for ch in line.chars() {
+        if current_width == width {
+            rows.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+
+        current.push(ch);
+        current_width += 1;
+    }
+
+    if !current.is_empty() || line.is_empty() {
+        rows.push(current);
+    }
+
+    rows
 }
 
 struct ShellClient {
@@ -491,9 +530,38 @@ fn help_lines() -> &'static [&'static str] {
         "  set name rust",
         "  set greeting \"hello rust\"",
         "  get name",
+        "  del name",
         "  expire name 30",
         "  ttl name",
         "  info",
         "Local commands: help, clear, quit",
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_history_text_keeps_latest_response_after_wrapped_line() {
+        let mut app = ShellApp::new(String::from("127.0.0.1:6379"));
+        app.push_response(
+            "{\"server_version\":\"0.1.0\",\"total_commands\":1,\"connected_clients\":1}",
+        );
+        app.push_response("PONG");
+
+        let text = app.visible_history_text(16, 3);
+
+        assert!(text.ends_with("< PONG"));
+        assert!(text.lines().count() <= 3);
+    }
+
+    #[test]
+    fn del_with_one_key_is_a_complete_command() {
+        let ShellAction::Send(args) = parse_shell_input("del name").unwrap() else {
+            panic!("expected del to be sent to the server");
+        };
+
+        assert_eq!(args, vec![b"del".to_vec(), b"name".to_vec()]);
+    }
 }
