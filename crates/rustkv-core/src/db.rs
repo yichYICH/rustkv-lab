@@ -1,12 +1,18 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::mem::size_of;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::sync::RwLock;
 use tokio::time::Instant;
 
 use crate::entry::Entry;
 use crate::error::KvError;
 use crate::storage::StorageEngine;
+
+pub const DEFAULT_SHARD_COUNT: usize = 16;
 
 #[derive(Debug, Default, Clone)]
 pub struct Database {
@@ -188,6 +194,307 @@ impl StorageEngine for Database {
         let before = self.data.len();
         self.data.retain(|_, entry| !entry.is_expired());
         before.saturating_sub(self.data.len())
+    }
+}
+
+#[derive(Debug)]
+pub struct DbOutcome<T> {
+    pub result: Result<T, KvError>,
+    pub key_count: usize,
+    pub expired_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbInfoSnapshot {
+    pub key_count: usize,
+    pub memory_estimate_bytes: usize,
+    pub expired_count: usize,
+}
+
+#[derive(Debug)]
+pub struct ShardedDatabase {
+    global: RwLock<()>,
+    shards: Vec<RwLock<Database>>,
+    key_count: AtomicUsize,
+}
+
+impl ShardedDatabase {
+    pub fn new(shard_count: usize) -> Self {
+        let shard_count = shard_count.max(1);
+        let shards = (0..shard_count)
+            .map(|_| RwLock::new(Database::new()))
+            .collect();
+
+        Self {
+            global: RwLock::new(()),
+            shards,
+            key_count: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.key_count.load(Ordering::Relaxed)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub async fn set(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        expire: Option<Duration>,
+    ) -> DbOutcome<()> {
+        let _global = self.global.read().await;
+        let shard = self.shard_for_key(&key);
+        let mut db = self.shards[shard].write().await;
+        let before = db.len();
+        let expired_count = db.remove_expired();
+        let result = db.set(key, value, expire);
+        let after = db.len();
+        self.apply_len_change(before, after);
+
+        DbOutcome {
+            result,
+            key_count: self.len(),
+            expired_count,
+        }
+    }
+
+    pub async fn set_at_ms(&self, key: String, value: Vec<u8>, timestamp_ms: u64) -> DbOutcome<()> {
+        let _global = self.global.read().await;
+        let shard = self.shard_for_key(&key);
+        let mut db = self.shards[shard].write().await;
+        let before = db.len();
+        let expired_count = db.remove_expired();
+        let result = db.set_at_ms(key, value, timestamp_ms);
+        let after = db.len();
+        self.apply_len_change(before, after);
+
+        DbOutcome {
+            result,
+            key_count: self.len(),
+            expired_count,
+        }
+    }
+
+    pub async fn get(&self, key: &str) -> DbOutcome<Option<Vec<u8>>> {
+        let _global = self.global.read().await;
+        let shard = self.shard_for_key(key);
+        let mut db = self.shards[shard].write().await;
+        let before = db.len();
+        let result = db.get(key);
+        let after = db.len();
+        self.apply_len_change(before, after);
+
+        DbOutcome {
+            result,
+            key_count: self.len(),
+            expired_count: before.saturating_sub(after),
+        }
+    }
+
+    pub async fn del(&self, keys: &[String]) -> DbOutcome<usize> {
+        let _global = self.global.read().await;
+        let mut removed = 0;
+        let mut expired_count = 0;
+
+        for key in keys {
+            let shard = self.shard_for_key(key);
+            let mut db = self.shards[shard].write().await;
+            let before = db.len();
+            let result = db.del(std::slice::from_ref(key));
+            let after = db.len();
+            self.apply_len_change(before, after);
+
+            match result {
+                Ok(count) => {
+                    removed += count;
+                    expired_count += before.saturating_sub(after).saturating_sub(count);
+                }
+                Err(error) => {
+                    return DbOutcome {
+                        result: Err(error),
+                        key_count: self.len(),
+                        expired_count,
+                    };
+                }
+            }
+        }
+
+        DbOutcome {
+            result: Ok(removed),
+            key_count: self.len(),
+            expired_count,
+        }
+    }
+
+    pub async fn exists(&self, key: &str) -> DbOutcome<bool> {
+        let _global = self.global.read().await;
+        let shard = self.shard_for_key(key);
+        let mut db = self.shards[shard].write().await;
+        let before = db.len();
+        let result = db.exists(key);
+        let after = db.len();
+        self.apply_len_change(before, after);
+
+        DbOutcome {
+            result,
+            key_count: self.len(),
+            expired_count: before.saturating_sub(after),
+        }
+    }
+
+    pub async fn keys(&self) -> Result<Vec<String>, KvError> {
+        let _global = self.global.write().await;
+        let mut keys = Vec::new();
+
+        for shard in &self.shards {
+            let db = shard.read().await;
+            keys.extend(db.keys()?);
+        }
+
+        keys.sort();
+        Ok(keys)
+    }
+
+    pub async fn expire(&self, key: String, seconds: u64) -> DbOutcome<bool> {
+        let _global = self.global.read().await;
+        let shard = self.shard_for_key(&key);
+        let mut db = self.shards[shard].write().await;
+        let before = db.len();
+        let result = db.expire(key, seconds);
+        let after = db.len();
+        self.apply_len_change(before, after);
+
+        DbOutcome {
+            result,
+            key_count: self.len(),
+            expired_count: before.saturating_sub(after),
+        }
+    }
+
+    pub async fn expire_at_ms(&self, key: String, timestamp_ms: u64) -> DbOutcome<bool> {
+        let _global = self.global.read().await;
+        let shard = self.shard_for_key(&key);
+        let mut db = self.shards[shard].write().await;
+        let before = db.len();
+        let result = db.expire_at_ms(key, timestamp_ms);
+        let after = db.len();
+        self.apply_len_change(before, after);
+
+        DbOutcome {
+            result,
+            key_count: self.len(),
+            expired_count: before.saturating_sub(after),
+        }
+    }
+
+    pub async fn ttl(&self, key: &str) -> DbOutcome<i64> {
+        let _global = self.global.read().await;
+        let shard = self.shard_for_key(key);
+        let mut db = self.shards[shard].write().await;
+        let before = db.len();
+        let result = db.ttl(key);
+        let after = db.len();
+        self.apply_len_change(before, after);
+
+        DbOutcome {
+            result,
+            key_count: self.len(),
+            expired_count: before.saturating_sub(after),
+        }
+    }
+
+    pub async fn flushdb(&self) -> DbOutcome<()> {
+        let _global = self.global.write().await;
+
+        for shard in &self.shards {
+            let mut db = shard.write().await;
+            if let Err(error) = db.flushdb() {
+                return DbOutcome {
+                    result: Err(error),
+                    key_count: self.len(),
+                    expired_count: 0,
+                };
+            }
+        }
+
+        self.key_count.store(0, Ordering::Relaxed);
+
+        DbOutcome {
+            result: Ok(()),
+            key_count: 0,
+            expired_count: 0,
+        }
+    }
+
+    pub async fn info_snapshot(&self) -> DbInfoSnapshot {
+        let _global = self.global.write().await;
+        let mut expired_count = 0;
+        let mut memory_estimate_bytes = 0;
+
+        for shard in &self.shards {
+            let mut db = shard.write().await;
+            let before = db.len();
+            let removed = db.remove_expired();
+            let after = db.len();
+            self.apply_len_change(before, after);
+            expired_count += removed;
+            memory_estimate_bytes += db.memory_estimate_bytes();
+        }
+
+        DbInfoSnapshot {
+            key_count: self.len(),
+            memory_estimate_bytes,
+            expired_count,
+        }
+    }
+
+    pub async fn remove_expired(&self) -> (usize, usize) {
+        let _global = self.global.write().await;
+        let mut expired_count = 0;
+
+        for shard in &self.shards {
+            let mut db = shard.write().await;
+            let before = db.len();
+            let removed = db.remove_expired();
+            let after = db.len();
+            self.apply_len_change(before, after);
+            expired_count += removed;
+        }
+
+        (expired_count, self.len())
+    }
+
+    fn shard_for_key(&self, key: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.shards.len()
+    }
+
+    fn apply_len_change(&self, before: usize, after: usize) {
+        if after >= before {
+            self.key_count.fetch_add(after - before, Ordering::Relaxed);
+        } else {
+            let delta = before - after;
+            let _ = self
+                .key_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(delta))
+                });
+        }
+    }
+}
+
+impl Default for ShardedDatabase {
+    fn default() -> Self {
+        Self::new(DEFAULT_SHARD_COUNT)
     }
 }
 

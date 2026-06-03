@@ -2,14 +2,12 @@ use std::io;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustkv_core::command::Command;
-use rustkv_core::db::Database;
-use rustkv_core::storage::StorageEngine;
+use rustkv_core::db::ShardedDatabase;
 use rustkv_protocol::encoder::encode_resp;
 use rustkv_protocol::parser::parse_resp;
 use rustkv_protocol::resp::RespValue;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
 
 pub struct AofEngine {
     file: File,
@@ -40,7 +38,7 @@ impl AofEngine {
         self.file.sync_all().await
     }
 
-    pub async fn load_and_replay(path: &str, db: &RwLock<Database>) -> Result<(), io::Error> {
+    pub async fn load_and_replay(path: &str, db: &ShardedDatabase) -> Result<(), io::Error> {
         let mut file = match File::open(path).await {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -138,12 +136,12 @@ fn expire_at_ms_from_now(duration: &Duration) -> u64 {
     target_ms.min(u128::from(u64::MAX)) as u64
 }
 
-async fn replay_command(cmd: Command, db: &RwLock<Database>) -> Result<(), io::Error> {
+async fn replay_command(cmd: Command, db: &ShardedDatabase) -> Result<(), io::Error> {
     match cmd {
         Command::Set { key, value, expire } => {
-            db.write()
+            db.set(key, value, expire)
                 .await
-                .set(key, value, expire)
+                .result
                 .map_err(command_replay_error)?;
         }
         Command::SetPxAt {
@@ -151,28 +149,28 @@ async fn replay_command(cmd: Command, db: &RwLock<Database>) -> Result<(), io::E
             value,
             timestamp_ms,
         } => {
-            db.write()
+            db.set_at_ms(key, value, timestamp_ms)
                 .await
-                .set_at_ms(key, value, timestamp_ms)
+                .result
                 .map_err(command_replay_error)?;
         }
         Command::Del { keys } => {
-            db.write().await.del(&keys).map_err(command_replay_error)?;
+            db.del(&keys).await.result.map_err(command_replay_error)?;
         }
         Command::Expire { key, seconds } => {
-            db.write()
+            db.expire(key, seconds)
                 .await
-                .expire(key, seconds)
+                .result
                 .map_err(command_replay_error)?;
         }
         Command::ExpireAt { key, timestamp_ms } => {
-            db.write()
+            db.expire_at_ms(key, timestamp_ms)
                 .await
-                .expire_at_ms(key, timestamp_ms)
+                .result
                 .map_err(command_replay_error)?;
         }
         Command::FlushDb => {
-            db.write().await.flushdb().map_err(command_replay_error)?;
+            db.flushdb().await.result.map_err(command_replay_error)?;
         }
         _ => {}
     }
@@ -189,8 +187,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use rustkv_core::storage::StorageEngine;
-    use tokio::sync::RwLock;
+    use rustkv_core::db::ShardedDatabase;
 
     use super::*;
 
@@ -214,12 +211,12 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1_100)).await;
 
-        let db = RwLock::new(Database::new());
+        let db = ShardedDatabase::default();
         AofEngine::load_and_replay(path.to_str().expect("test path is valid UTF-8"), &db)
             .await
             .expect("replay AOF");
 
-        let ttl = db.write().await.ttl("ttl-key").expect("read ttl");
+        let ttl = db.ttl("ttl-key").await.result.expect("read ttl");
         assert!(
             (1..3).contains(&ttl),
             "TTL should keep elapsed time after replay, got {ttl}"
@@ -246,12 +243,12 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1_500)).await;
 
-        let db = RwLock::new(Database::new());
+        let db = ShardedDatabase::default();
         AofEngine::load_and_replay(path.to_str().expect("test path is valid UTF-8"), &db)
             .await
             .expect("replay AOF");
 
-        let value = db.write().await.get("expired").expect("read key");
+        let value = db.get("expired").await.result.expect("read key");
         assert_eq!(value, None);
 
         let _ = tokio::fs::remove_file(path).await;

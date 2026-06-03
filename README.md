@@ -12,10 +12,11 @@ RustKV-Lab 的定位是“教学型异步键值数据库实验系统”。
 
 - RESP 协议子集的解析与编码。
 - Tokio 异步 TCP server。
-- 基于 `HashMap<String, Entry>` 的内存键值存储。
+- 基于分片 `HashMap<String, Entry>` 的内存键值存储。
 - Redis-like 基础命令执行。
 - TTL 过期模型。
 - AOF 命令日志持久化。
+- 服务端运行参数集中配置。
 - CLI 客户端、TUI 监控和 benchmark 工具。
 - 单元测试与真实 TCP 集成测试。
 
@@ -35,6 +36,8 @@ RustKV-Lab 的定位是“教学型异步键值数据库实验系统”。
 | TCP server     | 基于 Tokio 监听 TCP 连接，每个客户端连接由独立异步任务处理                             |
 | RESP 协议解析  | 支持 Simple String、Error、Integer、Bulk String、Array、Null                           |
 | 命令系统       | 支持 `PING`、`SET`、`GET`、`DEL`、`EXISTS`、`KEYS`、`EXPIRE`、`TTL`、`FLUSHDB`、`INFO` |
+| 分片存储       | `ShardedDatabase` 按 key 自动路由到 shard，客户端命令不需要指定 shard                 |
+| 服务端配置     | `ServerConfig` 集中管理监听地址、AOF 路径、frame 限制、TTL 扫描间隔和 shard 数量       |
 | TTL 过期       | 支持惰性删除和后台 worker 主动清理                                                     |
 | AOF 持久化     | 写命令以 RESP frame 形式追加到 AOF 文件，重启时回放恢复                                |
 | CLI 客户端     | 支持一次性命令和长连接交互式 TUI shell                                                 |
@@ -49,10 +52,6 @@ RustKV-Lab 的定位是“教学型异步键值数据库实验系统”。
 rustkv-lab
 ├── Cargo.toml
 ├── README.md
-├── docs
-│   ├── architecture.md
-│   ├── protocol.md
-│   └── report_notes.md
 └── crates
     ├── rustkv-protocol
     ├── rustkv-core
@@ -118,7 +117,13 @@ crates/rustkv-server/tests/integration_tests.rs
 
 ## 5. 启动服务端
 
-普通启动：
+普通启动，使用默认配置 `127.0.0.1:6379`：
+
+```powershell
+cargo run -p rustkv-server
+```
+
+指定监听地址：
 
 ```powershell
 cargo run -p rustkv-server -- --addr 127.0.0.1:6379
@@ -134,7 +139,16 @@ cargo run -p rustkv-server -- --addr 127.0.0.1:6379 --aof rustkv.aof
 
 - `--addr` 指定监听地址。
 - `--aof` 指定 AOF 日志文件路径。
+- `--max-frame-size` 指定单个 RESP frame 的最大字节数，默认 `1048576`。
+- `--ttl-interval-ms` 指定后台 TTL worker 的扫描间隔，默认 `1000` 毫秒。
+- `--shards` 指定内存数据库 shard 数量，默认 `16`。客户端仍然只需要使用普通 `SET` / `GET` / `DEL` 命令，server 会根据 key 自动选择 shard。
 - 按 `Ctrl+C` 可触发关闭：停止 accept 新连接、通知 TTL worker 退出、等待连接任务收尾并刷新 AOF。
+
+示例：调整 frame 限制、TTL 扫描间隔和 shard 数量：
+
+```powershell
+cargo run -p rustkv-server -- --max-frame-size 2097152 --ttl-interval-ms 500 --shards 32
+```
 
 ## 6. CLI 使用示例
 
@@ -326,13 +340,14 @@ cargo run -p rustkv-bench -- --addr 127.0.0.1:6379 --requests 10000 --command mi
 
 | Rust 特性                 | 项目映射                                                                |
 | ------------------------- | ----------------------------------------------------------------------- |
-| ownership / borrowing     | `Database` 拥有 `String` 和 `Vec<u8>`；parser 借用输入 buffer           |
+| ownership / borrowing     | `Database` shard 拥有 `String` 和 `Vec<u8>`；parser 借用输入 buffer     |
 | lifetime                  | `RespFrame<'a>` 将解析结果生命周期绑定到输入字节流                      |
-| struct / enum             | `Entry`、`Database`、`ServerStats`、`Command`、`RespFrame`、`RespValue` |
+| struct / enum             | `Entry`、`Database`、`ShardedDatabase`、`ServerConfig`、`ServerStats`、`Command`、`RespFrame`、`RespValue` |
 | trait                     | `StorageEngine` 抽象数据库存储行为                                      |
 | 泛型                      | `to_json_string<T: serde::Serialize>`                                   |
 | `Result` 错误处理         | `ProtocolError`、`KvError`、I/O 错误逐层返回                            |
-| `Arc` / `RwLock`          | 多连接异步任务共享数据库和统计信息                                      |
+| `Arc` / `RwLock`          | 多连接异步任务共享分片数据库，每个 shard 独立加锁                       |
+| atomic                    | `ServerStats` 使用原子计数记录命令数、连接数、key 数量等指标            |
 | `async` / `await`         | TCP accept、read/write、AOF 文件 I/O、TTL worker                        |
 | cargo workspace           | 多 crate 分层构建和统一测试                                             |
 | cargo fmt / clippy / test | 格式化、静态检查和自动化测试保证工程质量                                |

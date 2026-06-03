@@ -8,18 +8,18 @@ use rustkv_protocol::ProtocolError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
-
 pub struct Connection {
     stream: TcpStream,
     buffer: BytesMut,
+    max_frame_size: usize,
 }
 
 impl Connection {
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: TcpStream, max_frame_size: usize) -> Self {
         Self {
             stream,
             buffer: BytesMut::with_capacity(4096),
+            max_frame_size,
         }
     }
 
@@ -27,7 +27,7 @@ impl Connection {
         loop {
             match parse_resp(&self.buffer) {
                 Ok((_frame, consumed)) => {
-                    if consumed > MAX_FRAME_SIZE {
+                    if consumed > self.max_frame_size {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "request exceeds maximum frame size: frame too large",
@@ -46,7 +46,7 @@ impl Connection {
                 }
             }
 
-            if self.buffer.len() > MAX_FRAME_SIZE {
+            if self.buffer.len() > self.max_frame_size {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "request exceeds maximum frame size: frame too large",
@@ -65,7 +65,7 @@ impl Connection {
                 ));
             }
 
-            if self.buffer.len() > MAX_FRAME_SIZE {
+            if self.buffer.len() > self.max_frame_size {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "request exceeds maximum frame size: frame too large",

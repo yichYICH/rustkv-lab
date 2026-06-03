@@ -11,10 +11,9 @@ mod tests {
     use std::time::Duration;
 
     use rustkv_protocol::resp::{RespFrame, RespValue};
-    use tokio::sync::RwLock;
 
     use crate::command::Command;
-    use crate::db::{to_json_string, Database};
+    use crate::db::{to_json_string, Database, ShardedDatabase};
     use crate::error::KvError;
     use crate::executor::execute_command;
     use crate::stats::ServerStats;
@@ -341,6 +340,38 @@ mod tests {
         assert!(db.is_empty());
     }
 
+    #[tokio::test]
+    async fn sharded_database_routes_keys_internally() {
+        let db = ShardedDatabase::new(4);
+
+        assert_eq!(db.shard_count(), 4);
+
+        db.set(String::from("name"), b"rust".to_vec(), None)
+            .await
+            .result
+            .unwrap();
+        db.set(String::from("course"), b"kv".to_vec(), None)
+            .await
+            .result
+            .unwrap();
+
+        assert_eq!(db.len(), 2);
+        assert_eq!(db.get("name").await.result.unwrap(), Some(b"rust".to_vec()));
+        assert_eq!(
+            db.keys().await.unwrap(),
+            vec![String::from("course"), String::from("name")]
+        );
+
+        let removed = db
+            .del(&[String::from("name"), String::from("missing")])
+            .await
+            .result
+            .unwrap();
+
+        assert_eq!(removed, 1);
+        assert_eq!(db.len(), 1);
+    }
+
     #[test]
     fn stats_serializes_as_a_snapshot() {
         let stats = ServerStats::new();
@@ -367,8 +398,8 @@ mod tests {
 
     #[tokio::test]
     async fn executor_runs_commands_and_updates_stats() {
-        let db = RwLock::new(Database::new());
-        let stats = RwLock::new(ServerStats::new());
+        let db = ShardedDatabase::default();
+        let stats = ServerStats::new();
 
         let response = execute_command(
             Command::Set {

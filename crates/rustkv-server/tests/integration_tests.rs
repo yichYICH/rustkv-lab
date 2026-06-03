@@ -6,13 +6,14 @@ use rustkv_protocol::encoder::encode_resp;
 use rustkv_protocol::parser::parse_resp;
 use rustkv_protocol::resp::{RespFrame, RespValue};
 use rustkv_protocol::ProtocolError;
+use rustkv_server::server::{ServerConfig, DEFAULT_MAX_FRAME_SIZE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
-const TEST_MAX_FRAME_SIZE: usize = 1024 * 1024;
+const TEST_MAX_FRAME_SIZE: usize = DEFAULT_MAX_FRAME_SIZE;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ping_returns_pong() -> TestResult<()> {
@@ -268,7 +269,12 @@ async fn spawn_test_server_with_aof(
     let addr = listener.local_addr()?;
 
     let server_task = tokio::spawn(async move {
-        if let Err(error) = rustkv_server::server::run_with_listener(listener, aof_path).await {
+        let config = ServerConfig {
+            aof_path,
+            ..ServerConfig::default()
+        };
+
+        if let Err(error) = rustkv_server::server::run_with_listener(listener, config).await {
             eprintln!("test server stopped with error: {error}");
         }
     });
@@ -288,8 +294,12 @@ async fn spawn_stoppable_test_server_with_aof(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let server_task = tokio::spawn(async move {
-        rustkv_server::server::run_with_listener_and_shutdown(listener, Some(aof_path), shutdown_rx)
-            .await
+        let config = ServerConfig {
+            aof_path: Some(aof_path),
+            ..ServerConfig::default()
+        };
+
+        rustkv_server::server::run_with_listener_and_shutdown(listener, config, shutdown_rx).await
     });
 
     Ok((addr, shutdown_tx, server_task))
