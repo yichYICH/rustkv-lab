@@ -179,7 +179,6 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &ShellApp) {
     } else {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     };
-
     let lines = vec![
         Line::from(vec![
             Span::styled(
