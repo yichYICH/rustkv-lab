@@ -6,7 +6,9 @@ use crate::error::KvError;
 use crate::stats::ServerStats;
 
 pub async fn execute_command(cmd: Command, db: &ShardedDatabase, stats: &ServerStats) -> RespValue {
-    stats.incr_total_commands();
+    if !matches!(cmd, Command::Info) {
+        stats.incr_total_commands();
+    }
 
     match cmd {
         Command::Ping => RespValue::SimpleString(String::from("PONG")),

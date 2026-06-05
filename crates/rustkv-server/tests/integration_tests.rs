@@ -151,9 +151,7 @@ async fn info_returns_json_with_runtime_fields() -> TestResult<()> {
         .as_u64()
         .is_some_and(|bytes| bytes > 0));
     assert!(value["uptime_seconds"].as_u64().is_some());
-    assert!(value["total_commands"]
-        .as_u64()
-        .is_some_and(|count| count >= 2));
+    assert_eq!(value["total_commands"], 1);
     assert!(value["connected_clients"]
         .as_u64()
         .is_some_and(|count| count >= 1));

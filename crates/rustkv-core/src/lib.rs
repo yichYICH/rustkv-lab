@@ -438,12 +438,29 @@ mod tests {
         assert_eq!(value["aof_enabled"], false);
         assert_eq!(value["addr"], "unknown");
         assert_eq!(value["max_frame_size"], 0);
-        assert_eq!(value["total_commands"], 3);
+        assert_eq!(value["total_commands"], 2);
         assert_eq!(value["set_count"], 1);
         assert_eq!(value["get_count"], 1);
         assert_eq!(value["key_count"], 1);
         assert!(value["memory_estimate_bytes"]
             .as_u64()
             .is_some_and(|bytes| bytes > 0));
+    }
+
+    #[tokio::test]
+    async fn info_command_does_not_increment_total_commands() {
+        let db = ShardedDatabase::default();
+        let stats = ServerStats::new();
+
+        let response = execute_command(Command::Info, &db, &stats).await;
+        assert!(matches!(response, RespValue::BulkString(_)));
+
+        let response = execute_command(Command::Info, &db, &stats).await;
+        let RespValue::BulkString(bytes) = response else {
+            panic!("INFO must return a bulk string");
+        };
+
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["total_commands"], 0);
     }
 }
