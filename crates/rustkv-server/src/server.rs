@@ -268,7 +268,7 @@ fn shutdown_signal() -> watch::Receiver<bool> {
     tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
             Ok(()) => {
-                info!("Ctrl+C received; starting graceful shutdown");
+                info!("Ctrl+C received; starting shutdown");
                 if shutdown_tx.send(true).is_err() {
                     warn!("shutdown signal receiver was dropped before notification");
                 }
