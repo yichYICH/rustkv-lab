@@ -199,6 +199,134 @@ async fn aof_reload_restores_written_key() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aof_background_rewrite_compacts_and_restores_final_state() -> TestResult<()> {
+    let aof_path = temp_aof_path()?;
+    let aof_path_text = aof_path.to_string_lossy().to_string();
+
+    let rewrite_config = ServerConfig {
+        aof_path: Some(aof_path_text.clone()),
+        aof_rewrite_interval: Duration::from_millis(50),
+        aof_rewrite_min_size: 1,
+        ..ServerConfig::default()
+    };
+    let (addr, shutdown, server_task) =
+        spawn_stoppable_test_server_with_config(rewrite_config).await?;
+
+    assert_eq!(
+        send_command(
+            addr,
+            &[b"SET".as_slice(), b"name".as_slice(), b"old".as_slice()]
+        )
+        .await?,
+        RespValue::SimpleString(String::from("OK"))
+    );
+    assert_eq!(
+        send_command(
+            addr,
+            &[b"SET".as_slice(), b"name".as_slice(), b"new".as_slice()]
+        )
+        .await?,
+        RespValue::SimpleString(String::from("OK"))
+    );
+    assert_eq!(
+        send_command(
+            addr,
+            &[
+                b"SET".as_slice(),
+                b"deleted".as_slice(),
+                b"value".as_slice()
+            ]
+        )
+        .await?,
+        RespValue::SimpleString(String::from("OK"))
+    );
+    assert_eq!(
+        send_command(addr, &[b"DEL".as_slice(), b"deleted".as_slice()]).await?,
+        RespValue::Integer(1)
+    );
+
+    wait_for_aof_frame_count(&aof_path, 1).await?;
+
+    shutdown.send(true)?;
+    tokio::time::timeout(Duration::from_secs(2), server_task).await???;
+
+    let (addr, shutdown, server_task) = spawn_stoppable_test_server_with_aof(aof_path_text).await?;
+
+    assert_eq!(
+        send_command(addr, &[b"GET".as_slice(), b"name".as_slice()]).await?,
+        RespValue::BulkString(b"new".to_vec())
+    );
+    assert_eq!(
+        send_command(addr, &[b"GET".as_slice(), b"deleted".as_slice()]).await?,
+        RespValue::Null
+    );
+
+    shutdown.send(true)?;
+    tokio::time::timeout(Duration::from_secs(2), server_task).await???;
+
+    let _ = tokio::fs::remove_file(aof_path).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aof_background_rewrite_keeps_later_successful_writes() -> TestResult<()> {
+    let aof_path = temp_aof_path()?;
+    let aof_path_text = aof_path.to_string_lossy().to_string();
+
+    let rewrite_config = ServerConfig {
+        aof_path: Some(aof_path_text.clone()),
+        aof_rewrite_interval: Duration::from_millis(20),
+        aof_rewrite_min_size: 1,
+        ..ServerConfig::default()
+    };
+    let (addr, shutdown, server_task) =
+        spawn_stoppable_test_server_with_config(rewrite_config).await?;
+
+    for value in 0..20 {
+        let text = value.to_string();
+        assert_eq!(
+            send_command(
+                addr,
+                &[b"SET".as_slice(), b"counter".as_slice(), text.as_bytes()]
+            )
+            .await?,
+            RespValue::SimpleString(String::from("OK"))
+        );
+    }
+
+    assert_eq!(
+        send_command(
+            addr,
+            &[
+                b"SET".as_slice(),
+                b"counter".as_slice(),
+                b"final".as_slice()
+            ]
+        )
+        .await?,
+        RespValue::SimpleString(String::from("OK"))
+    );
+
+    wait_for_aof_frame_count(&aof_path, 1).await?;
+
+    shutdown.send(true)?;
+    tokio::time::timeout(Duration::from_secs(2), server_task).await???;
+
+    let (addr, shutdown, server_task) = spawn_stoppable_test_server_with_aof(aof_path_text).await?;
+
+    assert_eq!(
+        send_command(addr, &[b"GET".as_slice(), b"counter".as_slice()]).await?,
+        RespValue::BulkString(b"final".to_vec())
+    );
+
+    shutdown.send(true)?;
+    tokio::time::timeout(Duration::from_secs(2), server_task).await???;
+
+    let _ = tokio::fs::remove_file(aof_path).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_incomplete_frame_is_disconnected() -> TestResult<()> {
     let (addr, server_task) = spawn_test_server().await?;
     let mut stream = TcpStream::connect(addr).await?;
@@ -287,16 +415,26 @@ async fn spawn_stoppable_test_server_with_aof(
     watch::Sender<bool>,
     JoinHandle<Result<(), std::io::Error>>,
 )> {
+    let config = ServerConfig {
+        aof_path: Some(aof_path),
+        ..ServerConfig::default()
+    };
+
+    spawn_stoppable_test_server_with_config(config).await
+}
+
+async fn spawn_stoppable_test_server_with_config(
+    config: ServerConfig,
+) -> TestResult<(
+    SocketAddr,
+    watch::Sender<bool>,
+    JoinHandle<Result<(), std::io::Error>>,
+)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let server_task = tokio::spawn(async move {
-        let config = ServerConfig {
-            aof_path: Some(aof_path),
-            ..ServerConfig::default()
-        };
-
         rustkv_server::server::run_with_listener_and_shutdown(listener, config, shutdown_rx).await
     });
 
@@ -306,6 +444,37 @@ async fn spawn_stoppable_test_server_with_aof(
 fn temp_aof_path() -> TestResult<std::path::PathBuf> {
     let id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     Ok(std::env::temp_dir().join(format!("rustkv-lab-info-{id}.aof")))
+}
+
+async fn wait_for_aof_frame_count(path: &std::path::Path, expected: usize) -> TestResult<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+
+    loop {
+        if let Ok(bytes) = tokio::fs::read(path).await {
+            if aof_frame_count(&bytes)? == expected {
+                return Ok(());
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("AOF did not reach {expected} frame(s) in time").into());
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn aof_frame_count(bytes: &[u8]) -> TestResult<usize> {
+    let mut offset = 0;
+    let mut count = 0;
+
+    while offset < bytes.len() {
+        let (_frame, consumed) = parse_resp(&bytes[offset..])?;
+        offset += consumed;
+        count += 1;
+    }
+
+    Ok(count)
 }
 
 async fn send_command(addr: SocketAddr, args: &[&[u8]]) -> TestResult<RespValue> {

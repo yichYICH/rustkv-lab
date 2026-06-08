@@ -9,8 +9,8 @@ use rustkv_core::stats::ServerStats;
 use rustkv_protocol::parser::parse_resp;
 use rustkv_protocol::resp::RespValue;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Mutex};
-use tokio::task::JoinSet;
+use tokio::sync::{watch, Mutex, RwLock};
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 
 use crate::aof::AofEngine;
@@ -20,6 +20,8 @@ use crate::ttl::start_ttl_worker;
 pub const DEFAULT_ADDR: &str = "127.0.0.1:6379";
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_TTL_INTERVAL_MS: u64 = 1_000;
+pub const DEFAULT_AOF_REWRITE_INTERVAL_MS: u64 = 60_000;
+pub const DEFAULT_AOF_REWRITE_MIN_SIZE: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -28,6 +30,8 @@ pub struct ServerConfig {
     pub max_frame_size: usize,
     pub ttl_interval: Duration,
     pub shard_count: usize,
+    pub aof_rewrite_interval: Duration,
+    pub aof_rewrite_min_size: u64,
 }
 
 impl ServerConfig {
@@ -48,6 +52,18 @@ impl ServerConfig {
             return Err(invalid_config("shard count must be greater than 0"));
         }
 
+        if self.aof_rewrite_interval.is_zero() {
+            return Err(invalid_config(
+                "AOF rewrite interval must be greater than 0",
+            ));
+        }
+
+        if self.aof_rewrite_min_size == 0 {
+            return Err(invalid_config(
+                "AOF rewrite minimum size must be greater than 0",
+            ));
+        }
+
         Ok(())
     }
 }
@@ -60,13 +76,29 @@ impl Default for ServerConfig {
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             ttl_interval: Duration::from_millis(DEFAULT_TTL_INTERVAL_MS),
             shard_count: DEFAULT_SHARD_COUNT,
+            aof_rewrite_interval: Duration::from_millis(DEFAULT_AOF_REWRITE_INTERVAL_MS),
+            aof_rewrite_min_size: DEFAULT_AOF_REWRITE_MIN_SIZE,
         }
     }
 }
 
 type SharedDatabase = Arc<ShardedDatabase>;
 type SharedStats = Arc<ServerStats>;
-type SharedAof = Option<Arc<Mutex<AofEngine>>>;
+type SharedAof = Option<Arc<AofRuntime>>;
+
+struct AofRuntime {
+    engine: Mutex<AofEngine>,
+    rewrite_barrier: RwLock<()>,
+}
+
+impl AofRuntime {
+    fn new(engine: AofEngine) -> Self {
+        Self {
+            engine: Mutex::new(engine),
+            rewrite_barrier: RwLock::new(()),
+        }
+    }
+}
 
 pub async fn run(config: ServerConfig) -> Result<(), io::Error> {
     config.validate()?;
@@ -107,7 +139,7 @@ pub async fn run_with_listener_and_shutdown(
     let aof = if let Some(path) = &config.aof_path {
         AofEngine::load_and_replay(path, db.as_ref()).await?;
         info!(path = %path, "loaded AOF file");
-        Some(Arc::new(Mutex::new(AofEngine::new(path).await?)))
+        Some(Arc::new(AofRuntime::new(AofEngine::new(path).await?)))
     } else {
         None
     };
@@ -122,6 +154,15 @@ pub async fn run_with_listener_and_shutdown(
         config.ttl_interval,
         shutdown.clone(),
     );
+    let aof_rewrite_worker = aof.as_ref().map(|aof| {
+        start_aof_rewrite_worker(
+            aof.clone(),
+            db.clone(),
+            config.aof_rewrite_interval,
+            config.aof_rewrite_min_size,
+            shutdown.clone(),
+        )
+    });
     let mut client_tasks = JoinSet::new();
     let max_frame_size = config.max_frame_size;
 
@@ -130,6 +171,8 @@ pub async fn run_with_listener_and_shutdown(
         max_frame_size,
         shard_count = db.shard_count(),
         ttl_interval_ms = config.ttl_interval.as_millis(),
+        aof_rewrite_interval_ms = config.aof_rewrite_interval.as_millis(),
+        aof_rewrite_min_size = config.aof_rewrite_min_size,
         "rustkv server is listening"
     );
 
@@ -177,8 +220,14 @@ pub async fn run_with_listener_and_shutdown(
         warn!(error = %error, "TTL worker failed during shutdown");
     }
 
+    if let Some(aof_rewrite_worker) = aof_rewrite_worker {
+        if let Err(error) = aof_rewrite_worker.await {
+            warn!(error = %error, "AOF rewrite worker failed during shutdown");
+        }
+    }
+
     if let Some(aof) = &aof {
-        aof.lock().await.flush().await?;
+        aof.engine.lock().await.flush().await?;
         info!("AOF file flushed");
     }
 
@@ -222,17 +271,77 @@ async fn handle_client(
 
         if is_write_command(&command) {
             if let Some(aof) = &aof {
-                if let Err(error) = aof.lock().await.append(&command).await {
+                let _rewrite_guard = aof.rewrite_barrier.read().await;
+                let mut aof_engine = aof.engine.lock().await;
+                if let Err(error) = aof_engine.append(&command).await {
                     error!(error = %error, "failed to append command to AOF");
                     connection.write_value(&error_response(error)).await?;
                     continue;
                 }
+
+                let response = execute_command(command, db.as_ref(), stats.as_ref()).await;
+                connection.write_value(&response).await?;
+                continue;
             }
         }
 
         let response = execute_command(command, db.as_ref(), stats.as_ref()).await;
         connection.write_value(&response).await?;
     }
+}
+
+fn start_aof_rewrite_worker(
+    aof: Arc<AofRuntime>,
+    db: SharedDatabase,
+    rewrite_interval: Duration,
+    rewrite_min_size: u64,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(rewrite_interval);
+
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        info!("AOF rewrite worker received shutdown signal");
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(error) = maybe_rewrite_aof(&aof, db.as_ref(), rewrite_min_size).await {
+                        warn!(error = %error, "AOF rewrite failed");
+                    }
+                }
+            }
+        }
+
+        info!("AOF rewrite worker stopped");
+    })
+}
+
+async fn maybe_rewrite_aof(
+    aof: &AofRuntime,
+    db: &ShardedDatabase,
+    rewrite_min_size: u64,
+) -> Result<(), io::Error> {
+    let current_size = aof.engine.lock().await.file_size().await?;
+    if current_size < rewrite_min_size {
+        return Ok(());
+    }
+
+    let _rewrite_guard = aof.rewrite_barrier.write().await;
+    let snapshot = db.snapshot_entries().await;
+    aof.engine.lock().await.rewrite(&snapshot).await?;
+
+    info!(
+        old_size = current_size,
+        key_count = snapshot.key_count,
+        expired_count = snapshot.expired_count,
+        "AOF rewrite completed"
+    );
+
+    Ok(())
 }
 
 fn invalid_config(message: impl Into<String>) -> io::Error {

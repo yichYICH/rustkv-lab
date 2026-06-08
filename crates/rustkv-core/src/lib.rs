@@ -8,7 +8,7 @@ pub mod storage;
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use rustkv_protocol::resp::{RespFrame, RespValue};
 
@@ -372,6 +372,62 @@ mod tests {
         assert_eq!(db.len(), 1);
     }
 
+    #[tokio::test]
+    async fn sharded_database_snapshot_exports_only_live_entries() {
+        let db = ShardedDatabase::new(4);
+
+        db.set(String::from("alive"), b"value".to_vec(), None)
+            .await
+            .result
+            .unwrap();
+        db.set(
+            String::from("expired"),
+            b"gone".to_vec(),
+            Some(Duration::from_millis(10)),
+        )
+        .await
+        .result
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let snapshot = db.snapshot_entries().await;
+
+        assert_eq!(snapshot.expired_count, 1);
+        assert_eq!(snapshot.key_count, 1);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].key, "alive");
+        assert_eq!(snapshot.entries[0].value, b"value".to_vec());
+        assert_eq!(snapshot.entries[0].expire_at_ms, None);
+        assert_eq!(db.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sharded_database_snapshot_converts_ttl_to_unix_ms() {
+        let db = ShardedDatabase::new(4);
+
+        db.set(
+            String::from("ttl"),
+            b"value".to_vec(),
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .result
+        .unwrap();
+
+        let before_snapshot_ms = unix_now_ms();
+        let snapshot = db.snapshot_entries().await;
+        let after_snapshot_ms = unix_now_ms();
+
+        assert_eq!(snapshot.entries.len(), 1);
+        let expire_at_ms = snapshot.entries[0]
+            .expire_at_ms
+            .expect("TTL key should be exported with an absolute expiry");
+
+        assert!(expire_at_ms >= before_snapshot_ms);
+        assert!(expire_at_ms <= after_snapshot_ms + 5_000);
+    }
+
     #[test]
     fn stats_serializes_as_a_snapshot() {
         let stats = ServerStats::new();
@@ -462,5 +518,12 @@ mod tests {
 
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["total_commands"], 0);
+    }
+
+    fn unix_now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 }

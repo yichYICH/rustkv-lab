@@ -211,6 +211,20 @@ pub struct DbInfoSnapshot {
     pub expired_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbSnapshotEntry {
+    pub key: String,
+    pub value: Vec<u8>,
+    pub expire_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbSnapshot {
+    pub entries: Vec<DbSnapshotEntry>,
+    pub key_count: usize,
+    pub expired_count: usize,
+}
+
 #[derive(Debug)]
 pub struct ShardedDatabase {
     global: RwLock<()>,
@@ -472,6 +486,44 @@ impl ShardedDatabase {
         (expired_count, self.len())
     }
 
+    pub async fn snapshot_entries(&self) -> DbSnapshot {
+        let _global = self.global.write().await;
+        let mut entries = Vec::new();
+        let mut expired_count = 0;
+        let instant_now = Instant::now();
+        let unix_now_ms = current_unix_ms();
+
+        for shard in &self.shards {
+            let mut db = shard.write().await;
+            let before = db.len();
+            db.data.retain(|_, entry| {
+                entry
+                    .expire_at
+                    .is_none_or(|expire_at| instant_now < expire_at)
+            });
+            let after = db.len();
+            self.apply_len_change(before, after);
+            expired_count += before.saturating_sub(after);
+
+            entries.extend(db.data.iter().map(|(key, entry)| DbSnapshotEntry {
+                key: key.clone(),
+                value: entry.value.clone(),
+                expire_at_ms: entry.expire_at.map(|expire_at| {
+                    let remaining = expire_at.duration_since(instant_now);
+                    unix_ms_after(unix_now_ms, remaining)
+                }),
+            }));
+        }
+
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
+
+        DbSnapshot {
+            entries,
+            key_count: self.len(),
+            expired_count,
+        }
+    }
+
     fn shard_for_key(&self, key: &str) -> usize {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
@@ -514,4 +566,17 @@ fn duration_until_unix_ms(timestamp_ms: u64) -> Option<Duration> {
     let remaining_ms = target_ms - now_ms;
     let bounded_ms = remaining_ms.min(u128::from(u64::MAX));
     Some(Duration::from_millis(bounded_ms as u64))
+}
+
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn unix_ms_after(base_ms: u64, duration: Duration) -> u64 {
+    let target = u128::from(base_ms).saturating_add(duration.as_millis());
+    target.min(u128::from(u64::MAX)) as u64
 }

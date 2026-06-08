@@ -3,7 +3,8 @@ use std::time::Duration;
 use clap::Parser;
 use rustkv_core::db::DEFAULT_SHARD_COUNT;
 use rustkv_server::server::{
-    ServerConfig, DEFAULT_ADDR, DEFAULT_MAX_FRAME_SIZE, DEFAULT_TTL_INTERVAL_MS,
+    ServerConfig, DEFAULT_ADDR, DEFAULT_AOF_REWRITE_INTERVAL_MS, DEFAULT_AOF_REWRITE_MIN_SIZE,
+    DEFAULT_MAX_FRAME_SIZE, DEFAULT_TTL_INTERVAL_MS,
 };
 
 #[derive(Debug, Parser)]
@@ -20,6 +21,10 @@ struct Args {
     ttl_interval_ms: u64,
     #[arg(long, default_value_t = DEFAULT_SHARD_COUNT)]
     shards: usize,
+    #[arg(long, default_value_t = DEFAULT_AOF_REWRITE_INTERVAL_MS)]
+    aof_rewrite_interval_ms: u64,
+    #[arg(long, default_value_t = DEFAULT_AOF_REWRITE_MIN_SIZE)]
+    aof_rewrite_min_size: u64,
 }
 
 #[tokio::main]
@@ -33,6 +38,8 @@ async fn main() -> Result<(), std::io::Error> {
         max_frame_size: args.max_frame_size,
         ttl_interval: Duration::from_millis(args.ttl_interval_ms),
         shard_count: args.shards,
+        aof_rewrite_interval: Duration::from_millis(args.aof_rewrite_interval_ms),
+        aof_rewrite_min_size: args.aof_rewrite_min_size,
     };
 
     rustkv_server::server::run(config).await
