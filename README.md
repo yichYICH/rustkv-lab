@@ -15,7 +15,7 @@ RustKV-Lab 的定位是“教学型异步键值数据库实验系统”。
 - 基于分片 `HashMap<String, Entry>` 的内存键值存储。
 - Redis-like 基础命令执行。
 - TTL 过期模型。
-- AOF 命令日志持久化。
+- AOF 命令日志持久化、重启回放和后台 rewrite 压缩。
 - 服务端运行参数集中配置。
 - CLI 客户端、TUI 监控和 benchmark 工具。
 - 单元测试与真实 TCP 集成测试。
@@ -25,7 +25,6 @@ RustKV-Lab 的定位是“教学型异步键值数据库实验系统”。
 - Redis 完整命令集。
 - 集群、主从复制和哨兵。
 - RDB 快照。
-- AOF rewrite。
 - 鉴权、TLS 和公网安全部署。
 - 精确内存管理与淘汰策略。
 
@@ -37,14 +36,14 @@ RustKV-Lab 的定位是“教学型异步键值数据库实验系统”。
 | RESP 协议解析  | 支持 Simple String、Error、Integer、Bulk String、Array、Null                           |
 | 命令系统       | 支持 `PING`、`SET`、`GET`、`DEL`、`EXISTS`、`KEYS`、`EXPIRE`、`TTL`、`FLUSHDB`、`INFO` |
 | 分片存储       | `ShardedDatabase` 按 key 自动路由到 shard，客户端命令不需要指定 shard                 |
-| 服务端配置     | `ServerConfig` 集中管理监听地址、AOF 路径、frame 限制、TTL 扫描间隔和 shard 数量       |
+| 服务端配置     | `ServerConfig` 集中管理监听地址、AOF 路径、frame 限制、TTL 扫描间隔、shard 数量和 AOF rewrite 策略 |
 | TTL 过期       | 支持惰性删除和后台 worker 主动清理                                                     |
-| AOF 持久化     | 写命令以 RESP frame 形式追加到 AOF 文件，重启时回放恢复                                |
+| AOF 持久化     | 写命令以 RESP frame 形式追加到 AOF 文件，重启时回放恢复，并支持后台 rewrite 压缩历史命令 |
 | CLI 客户端     | 支持一次性命令和长连接交互式 TUI shell                                                 |
 | TUI 监控       | 使用 Ratatui 展示连接数、key 数量、命令计数、QPS、AOF 状态等                           |
 | benchmark 工具 | `rustkv-bench` 输出请求数、耗时、平均延迟和 QPS                                        |
 | 单元测试       | 覆盖协议、命令解析、数据库核心逻辑                                                     |
-| 集成测试       | 使用动态端口启动真实 server，测试 TCP 命令、TTL、AOF reload 和 frame 限制              |
+| 集成测试       | 使用动态端口启动真实 server，测试 TCP 命令、TTL、AOF reload、AOF rewrite 和 frame 限制 |
 
 ## 3. Workspace 项目结构
 
@@ -142,12 +141,14 @@ cargo run -p rustkv-server -- --addr 127.0.0.1:6379 --aof rustkv.aof
 - `--max-frame-size` 指定单个 RESP frame 的最大字节数，默认 `1048576`。
 - `--ttl-interval-ms` 指定后台 TTL worker 的扫描间隔，默认 `1000` 毫秒。
 - `--shards` 指定内存数据库 shard 数量，默认 `16`。客户端仍然只需要使用普通 `SET` / `GET` / `DEL` 命令，server 会根据 key 自动选择 shard。
-- 按 `Ctrl+C` 可触发关闭：停止 accept 新连接、通知 TTL worker 退出、等待连接任务收尾并刷新 AOF。
+- `--aof-rewrite-interval-ms` 指定后台 AOF rewrite worker 的检查间隔，默认 `60000` 毫秒。
+- `--aof-rewrite-min-size` 指定触发 AOF rewrite 的最小文件大小，默认 `1048576` 字节。
+- 按 `Ctrl+C` 可触发关闭：停止 accept 新连接、通知后台 worker 退出、等待连接任务收尾并刷新 AOF。
 
-示例：调整 frame 限制、TTL 扫描间隔和 shard 数量：
+示例：调整 frame 限制、TTL 扫描间隔、shard 数量和 AOF rewrite 策略：
 
 ```powershell
-cargo run -p rustkv-server -- --max-frame-size 2097152 --ttl-interval-ms 500 --shards 32
+cargo run -p rustkv-server -- --max-frame-size 2097152 --ttl-interval-ms 500 --shards 32 --aof-rewrite-interval-ms 30000 --aof-rewrite-min-size 524288
 ```
 
 ## 6. CLI 使用示例
